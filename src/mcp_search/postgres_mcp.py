@@ -7,7 +7,7 @@ import asyncpg
 from fastmcp import FastMCP
 from fastmcp.server.dependencies import get_context
 
-DATABASES = ("finance", "mylocation")
+DATABASES = ("finance", "mylocation", "scrobble")
 DML_PATTERN = re.compile(
     r"\b(INSERT|UPDATE|DELETE|DROP|ALTER|CREATE|TRUNCATE|GRANT|REVOKE|COPY)\b",
     re.IGNORECASE,
@@ -66,7 +66,7 @@ async def pg_discover_schema(
     """List tables and columns in a PostgreSQL database.
 
     Args:
-        database: Database name — 'finance' or 'mylocation'
+        database: Database name — 'finance', 'mylocation', or 'scrobble'
         table_filter: Optional substring to filter table names
     """
     pool = _get_pool(database)
@@ -109,7 +109,7 @@ async def pg_query(
     """Execute a read-only parameterised SQL query.
 
     Args:
-        database: Database name — 'finance' or 'mylocation'
+        database: Database name — 'finance', 'mylocation', or 'scrobble'
         query: SQL SELECT query using $1, $2 for parameters
         params: Optional list of parameter values
         response_format: 'text' for aligned columns, 'csv' for CSV format
