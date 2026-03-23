@@ -1,5 +1,6 @@
 """MCP server for read-only Immich photo library access."""
 
+import base64
 import os
 
 import httpx
@@ -223,6 +224,206 @@ async def immich_albums(
     table = _format_table(rows, ["name", "assets", "created", "updated"])
     ids = "\n".join(f"  {r['name']}: {r['id']}" for r in rows if r["id"])
     return f"Albums ({len(rows)}):\n\n{table}\n\nAlbum IDs:\n{ids}"
+
+
+@mcp.tool
+async def immich_faces(
+    person_id: str | None = None,
+    name: str | None = None,
+    page: int = 1,
+    size: int = 25,
+) -> str:
+    """List recognized people or find photos of a specific person.
+
+    Without arguments, lists all named people. With a person_id, finds their
+    photos. With a name, searches for matching people.
+
+    Args:
+        person_id: Person UUID — returns their photos
+        name: Search people by name (case-insensitive substring match)
+        page: Page number when fetching a person's photos (default 1)
+        size: Results per page for person's photos (default 25, max 100)
+    """
+    client = _client()
+
+    if person_id:
+        # Get person info + their assets via metadata search
+        resp = await client.get(f"{_IMMICH_URL}/api/people/{person_id}")
+        resp.raise_for_status()
+        person = resp.json()
+
+        resp = await client.post(
+            f"{_IMMICH_URL}/api/search/metadata",
+            json={"personIds": [person_id], "page": page, "size": min(size, 100)},
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        items = data.get("assets", {}).get("items", [])
+        total = data.get("assets", {}).get("total", 0)
+
+        pname = person.get("name") or "Unnamed"
+        header = f"Photos of {pname} (page {page}, {len(items)} of {total}):\n\n"
+        if not items:
+            return header + "No photos found."
+        return _format_assets(items, header)
+
+    # List all people
+    resp = await client.get(f"{_IMMICH_URL}/api/people?withHidden=false")
+    resp.raise_for_status()
+    data = resp.json()
+    people = data.get("people", data) if isinstance(data, dict) else data
+
+    if name:
+        needle = name.lower()
+        people = [p for p in people if needle in (p.get("name") or "").lower()]
+
+    if not people:
+        return "No matching people found."
+
+    rows = []
+    for p in people:
+        pname = p.get("name") or "Unnamed"
+        updated = (p.get("updatedAt") or "")[:19].replace("T", " ")
+        rows.append({
+            "name": pname,
+            "hidden": "yes" if p.get("isHidden") else "",
+            "updated": updated,
+            "id": p.get("id") or "",
+        })
+
+    table = _format_table(rows, ["name", "hidden", "updated", "id"])
+    return f"People ({len(rows)}):\n\n{table}"
+
+
+@mcp.tool
+async def immich_asset_info(
+    asset_id: str,
+) -> str:
+    """Get detailed EXIF and metadata for a specific asset.
+
+    Returns camera settings, GPS coordinates, file details, recognized faces,
+    and all available EXIF data.
+
+    Args:
+        asset_id: Asset UUID (from search results or album listings)
+    """
+    client = _client()
+    resp = await client.get(f"{_IMMICH_URL}/api/assets/{asset_id}")
+    resp.raise_for_status()
+    a = resp.json()
+
+    exif = a.get("exifInfo") or {}
+    lines = [f"# {a.get('originalFileName', '—')}"]
+    lines.append("")
+
+    # Basic info
+    lines.append(f"**Type:** {a.get('type', '—')}")
+    taken = (a.get("localDateTime") or a.get("fileCreatedAt") or "")[:19].replace("T", " ")
+    if taken:
+        lines.append(f"**Taken:** {taken}")
+    if a.get("duration") and a.get("duration") != "00:00:00.000":
+        lines.append(f"**Duration:** {a['duration']}")
+    mime = a.get("originalMimeType") or "—"
+    size_bytes = exif.get("fileSizeInByte")
+    size_str = f"{size_bytes / 1048576:.1f} MB" if size_bytes else "—"
+    lines.append(f"**File:** {mime}, {size_str}")
+    w = exif.get("exifImageWidth") or a.get("width")
+    h = exif.get("exifImageHeight") or a.get("height")
+    if w and h:
+        lines.append(f"**Dimensions:** {w} x {h}")
+    lines.append("")
+
+    # Camera / EXIF
+    camera_fields = []
+    if exif.get("make"):
+        camera_fields.append(f"**Make:** {exif['make']}")
+    if exif.get("model"):
+        camera_fields.append(f"**Model:** {exif['model']}")
+    if exif.get("lensModel"):
+        camera_fields.append(f"**Lens:** {exif['lensModel']}")
+    if exif.get("fNumber"):
+        camera_fields.append(f"**Aperture:** f/{exif['fNumber']}")
+    if exif.get("exposureTime"):
+        camera_fields.append(f"**Exposure:** {exif['exposureTime']}s")
+    if exif.get("iso"):
+        camera_fields.append(f"**ISO:** {exif['iso']}")
+    if exif.get("focalLength"):
+        camera_fields.append(f"**Focal Length:** {exif['focalLength']}mm")
+    if exif.get("orientation"):
+        camera_fields.append(f"**Orientation:** {exif['orientation']}")
+    if camera_fields:
+        lines.append("## Camera")
+        lines.extend(camera_fields)
+        lines.append("")
+
+    # Location
+    loc_fields = []
+    if exif.get("city"):
+        loc_fields.append(f"**City:** {exif['city']}")
+    if exif.get("state"):
+        loc_fields.append(f"**State:** {exif['state']}")
+    if exif.get("country"):
+        loc_fields.append(f"**Country:** {exif['country']}")
+    if exif.get("latitude") is not None and exif.get("longitude") is not None:
+        loc_fields.append(f"**GPS:** {exif['latitude']}, {exif['longitude']}")
+    if exif.get("timeZone"):
+        loc_fields.append(f"**Timezone:** {exif['timeZone']}")
+    if loc_fields:
+        lines.append("## Location")
+        lines.extend(loc_fields)
+        lines.append("")
+
+    # People / faces
+    people = a.get("people") or []
+    unassigned = a.get("unassignedFaces") or []
+    if people or unassigned:
+        lines.append("## Faces")
+        for p in people:
+            pname = p.get("name") or "Unnamed"
+            lines.append(f"- {pname} ({p.get('id', '')})")
+        if unassigned:
+            lines.append(f"- {len(unassigned)} unassigned face(s)")
+        lines.append("")
+
+    # Tags
+    tags = a.get("tags") or []
+    if tags:
+        tag_names = [t.get("name") or t.get("value") or str(t) for t in tags]
+        lines.append(f"**Tags:** {', '.join(tag_names)}")
+        lines.append("")
+
+    # Description
+    if exif.get("description"):
+        lines.append(f"**Description:** {exif['description']}")
+        lines.append("")
+
+    if exif.get("rating"):
+        lines.append(f"**Rating:** {exif['rating']}")
+
+    lines.append(f"**Asset ID:** {a.get('id', '')}")
+
+    return "\n".join(lines)
+
+
+@mcp.tool
+async def immich_thumbnail(
+    asset_id: str,
+    size: str = "thumbnail",
+) -> dict:
+    """Get a thumbnail image for an asset as base64.
+
+    Args:
+        asset_id: Asset UUID (from search results or album listings)
+        size: Thumbnail size — "thumbnail" (small) or "preview" (larger)
+    """
+    client = _client()
+    resp = await client.get(
+        f"{_IMMICH_URL}/api/assets/{asset_id}/thumbnail",
+        params={"size": size},
+    )
+    resp.raise_for_status()
+    mime = resp.headers.get("content-type", "image/jpeg")
+    return {"base64": base64.b64encode(resp.content).decode(), "mimeType": mime}
 
 
 if __name__ == "__main__":
