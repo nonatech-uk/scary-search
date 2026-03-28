@@ -15,10 +15,10 @@ import os
 import re
 from datetime import datetime, timezone
 
+import contextlib
+
 import aioimaplib
 from fastmcp import FastMCP
-from fastmcp.server.dependencies import get_context
-from fastmcp.server.lifespan import lifespan
 
 _IMAP_HOST = os.environ.get("IMAP_HOST", "mail.mees.st")
 _IMAP_PORT = int(os.environ.get("IMAP_PORT", "993"))
@@ -27,40 +27,25 @@ _ACCOUNTS: dict[str, str] = json.loads(os.environ.get("IMAP_ACCOUNTS", "{}"))
 # Folders that moves are blocked to
 _BLOCKED_FOLDERS = {"Deleted Items", "Deleted Messages", "Trash", "Junk", "Junk E-mail", "Spam"}
 
+mcp = FastMCP("imap")
 
-@lifespan
-async def imap_lifespan(server):
-    connections: dict[str, aioimaplib.IMAP4_SSL] = {}
-    for addr, password in _ACCOUNTS.items():
-        client = aioimaplib.IMAP4_SSL(host=_IMAP_HOST, port=_IMAP_PORT)
-        await client.wait_hello_from_server()
-        await client.login(addr, password)
-        connections[addr] = client
-    yield {"connections": connections, "accounts": list(_ACCOUNTS.keys())}
-    for client in connections.values():
+
+@contextlib.asynccontextmanager
+async def _imap_client(mailbox: str):
+    """Create a fresh IMAP connection for a single tool call, then close it."""
+    if mailbox not in _ACCOUNTS:
+        available = ", ".join(sorted(_ACCOUNTS.keys()))
+        raise ValueError(f"Unknown mailbox '{mailbox}'. Available: {available}")
+    client = aioimaplib.IMAP4_SSL(host=_IMAP_HOST, port=_IMAP_PORT)
+    await client.wait_hello_from_server()
+    await client.login(mailbox, _ACCOUNTS[mailbox])
+    try:
+        yield client
+    finally:
         try:
             await client.logout()
         except Exception:
             pass
-
-
-mcp = FastMCP("imap", lifespan=imap_lifespan)
-
-
-def _connections() -> dict[str, aioimaplib.IMAP4_SSL]:
-    return get_context().lifespan_context["connections"]
-
-
-def _account_list() -> list[str]:
-    return get_context().lifespan_context["accounts"]
-
-
-def _get_client(mailbox: str) -> aioimaplib.IMAP4_SSL:
-    conns = _connections()
-    if mailbox not in conns:
-        available = ", ".join(sorted(conns.keys()))
-        raise ValueError(f"Unknown mailbox '{mailbox}'. Available: {available}")
-    return conns[mailbox]
 
 
 def _to_str(val: str | bytes | bytearray) -> str:
@@ -159,11 +144,11 @@ def _parse_headers(resp) -> list[dict]:
 @mcp.tool
 async def imap_accounts() -> str:
     """List all configured IMAP mailbox accounts."""
-    accounts = _account_list()
+    accounts = sorted(_ACCOUNTS.keys())
     if not accounts:
         return "No IMAP accounts configured."
     lines = [f"Configured IMAP accounts ({len(accounts)}):\n"]
-    for a in sorted(accounts):
+    for a in accounts:
         lines.append(f"  {a}")
     return "\n".join(lines)
 
@@ -176,29 +161,28 @@ async def imap_folders(mailbox: str) -> str:
         mailbox: Email address of the account (e.g. 'user@mees.st')
     """
     try:
-        client = _get_client(mailbox)
+        async with _imap_client(mailbox) as client:
+            resp = await client.list('""', "*")
+            if resp.result != "OK":
+                return f"Failed to list folders: {resp.result}"
+
+            folders = []
+            for line in resp.lines:
+                line_str = _to_str(line).strip()
+                if not line_str:
+                    continue
+                match = re.match(r'\(([^)]*)\)\s+"([^"]+)"\s+"?([^"]+)"?', line_str)
+                if match:
+                    flags, _delim, name = match.groups()
+                    name = name.strip('"')
+                    folders.append(f"  {name}  [{flags}]")
+
+            if not folders:
+                return "No folders found."
+
+            return f"IMAP Folders for {mailbox} ({len(folders)}):\n\n" + "\n".join(sorted(folders))
     except ValueError as e:
         return str(e)
-
-    resp = await client.list('""', "*")
-    if resp.result != "OK":
-        return f"Failed to list folders: {resp.result}"
-
-    folders = []
-    for line in resp.lines:
-        line_str = _to_str(line).strip()
-        if not line_str:
-            continue
-        match = re.match(r'\(([^)]*)\)\s+"([^"]+)"\s+"?([^"]+)"?', line_str)
-        if match:
-            flags, _delim, name = match.groups()
-            name = name.strip('"')
-            folders.append(f"  {name}  [{flags}]")
-
-    if not folders:
-        return "No folders found."
-
-    return f"IMAP Folders for {mailbox} ({len(folders)}):\n\n" + "\n".join(sorted(folders))
 
 
 @mcp.tool
@@ -227,68 +211,67 @@ async def imap_search(
         limit: Max results to return (default 25, max 100)
     """
     try:
-        client = _get_client(mailbox)
+        async with _imap_client(mailbox) as client:
+            resp = await client.select(folder)
+            if resp.result != "OK":
+                return f"Cannot open folder '{folder}': {resp.result}"
+
+            criteria = []
+            if query:
+                criteria.append(f'TEXT "{query}"')
+            if from_addr:
+                criteria.append(f'FROM "{from_addr}"')
+            if subject:
+                criteria.append(f'SUBJECT "{subject}"')
+            if since:
+                try:
+                    dt = datetime.strptime(since, "%Y-%m-%d")
+                    criteria.append(f'SINCE {dt.strftime("%d-%b-%Y")}')
+                except ValueError:
+                    return "Invalid 'since' format — use YYYY-MM-DD."
+            if before:
+                try:
+                    dt = datetime.strptime(before, "%Y-%m-%d")
+                    criteria.append(f'BEFORE {dt.strftime("%d-%b-%Y")}')
+                except ValueError:
+                    return "Invalid 'before' format — use YYYY-MM-DD."
+            if unseen:
+                criteria.append("UNSEEN")
+
+            search_str = " ".join(criteria) if criteria else "ALL"
+            resp = await client.search(search_str)
+            if resp.result != "OK":
+                return f"Search failed: {resp.result}"
+
+            seqs = _parse_search_ids(resp)
+            if not seqs:
+                return "No messages found."
+
+            total = len(seqs)
+            limit = min(limit, 100)
+            seqs = seqs[-limit:]
+
+            seq_set = ",".join(seqs)
+            resp = await client.fetch(seq_set, "(FLAGS BODY.PEEK[HEADER.FIELDS (FROM SUBJECT DATE)])")
+            if resp.result != "OK":
+                return f"Fetch failed: {resp.result}"
+
+            messages = _parse_headers(resp)
+            if not messages:
+                return "No messages found."
+
+            lines = [f"Search results in '{mailbox}:{folder}' ({len(messages)} shown, {total} matched):\n"]
+            for m in reversed(messages):
+                flags = m.get("flags", "")
+                seen = "  " if "\\Seen" in flags else "* "
+                date = m.get("date", "?")
+                frm = m.get("from", "?")[:40]
+                subj = m.get("subject", "(no subject)")[:60]
+                lines.append(f"  {seen}{date} | {frm:40s} | {subj}")
+
+            return "\n".join(lines)
     except ValueError as e:
         return str(e)
-
-    resp = await client.select(folder)
-    if resp.result != "OK":
-        return f"Cannot open folder '{folder}': {resp.result}"
-
-    criteria = []
-    if query:
-        criteria.append(f'TEXT "{query}"')
-    if from_addr:
-        criteria.append(f'FROM "{from_addr}"')
-    if subject:
-        criteria.append(f'SUBJECT "{subject}"')
-    if since:
-        try:
-            dt = datetime.strptime(since, "%Y-%m-%d")
-            criteria.append(f'SINCE {dt.strftime("%d-%b-%Y")}')
-        except ValueError:
-            return "Invalid 'since' format — use YYYY-MM-DD."
-    if before:
-        try:
-            dt = datetime.strptime(before, "%Y-%m-%d")
-            criteria.append(f'BEFORE {dt.strftime("%d-%b-%Y")}')
-        except ValueError:
-            return "Invalid 'before' format — use YYYY-MM-DD."
-    if unseen:
-        criteria.append("UNSEEN")
-
-    search_str = " ".join(criteria) if criteria else "ALL"
-    resp = await client.search(search_str)
-    if resp.result != "OK":
-        return f"Search failed: {resp.result}"
-
-    seqs = _parse_search_ids(resp)
-    if not seqs:
-        return "No messages found."
-
-    total = len(seqs)
-    limit = min(limit, 100)
-    seqs = seqs[-limit:]
-
-    seq_set = ",".join(seqs)
-    resp = await client.fetch(seq_set, "(FLAGS BODY.PEEK[HEADER.FIELDS (FROM SUBJECT DATE)])")
-    if resp.result != "OK":
-        return f"Fetch failed: {resp.result}"
-
-    messages = _parse_headers(resp)
-    if not messages:
-        return "No messages found."
-
-    lines = [f"Search results in '{mailbox}:{folder}' ({len(messages)} shown, {total} matched):\n"]
-    for m in reversed(messages):
-        flags = m.get("flags", "")
-        seen = "  " if "\\Seen" in flags else "* "
-        date = m.get("date", "?")
-        frm = m.get("from", "?")[:40]
-        subj = m.get("subject", "(no subject)")[:60]
-        lines.append(f"  {seen}{date} | {frm:40s} | {subj}")
-
-    return "\n".join(lines)
 
 
 @mcp.tool
@@ -309,40 +292,40 @@ async def imap_read(
         subject_match: Subject substring to find (case-insensitive). Returns the latest match.
     """
     try:
-        client = _get_client(mailbox)
+        async with _imap_client(mailbox) as client:
+            resp = await client.select(folder)
+            if resp.result != "OK":
+                return f"Cannot open folder '{folder}': {resp.result}"
+
+            if sequence > 0:
+                msg_id = str(sequence)
+            elif subject_match:
+                resp = await client.search(f'SUBJECT "{subject_match}"')
+                if resp.result != "OK":
+                    return f"Search failed: {resp.result}"
+                seqs = _parse_search_ids(resp)
+                if not seqs:
+                    return f"No message matching subject '{subject_match}'."
+                msg_id = seqs[-1]
+            else:
+                return "Provide either sequence number or subject_match."
+
+            resp = await client.fetch(msg_id, "(FLAGS BODY.PEEK[])")
+            if resp.result != "OK":
+                return f"Failed to fetch message: {resp.result}"
+
+            # Find the raw email data (bytearray from aioimaplib)
+            raw_email = None
+            for line in resp.lines:
+                if isinstance(line, (bytes, bytearray)) and len(line) > 100:
+                    raw_email = bytes(line)
+                    break
+
+            if not raw_email:
+                return "Could not parse message."
+
     except ValueError as e:
         return str(e)
-
-    resp = await client.select(folder)
-    if resp.result != "OK":
-        return f"Cannot open folder '{folder}': {resp.result}"
-
-    if sequence > 0:
-        msg_id = str(sequence)
-    elif subject_match:
-        resp = await client.search(f'SUBJECT "{subject_match}"')
-        if resp.result != "OK":
-            return f"Search failed: {resp.result}"
-        seqs = _parse_search_ids(resp)
-        if not seqs:
-            return f"No message matching subject '{subject_match}'."
-        msg_id = seqs[-1]
-    else:
-        return "Provide either sequence number or subject_match."
-
-    resp = await client.fetch(msg_id, "(FLAGS BODY.PEEK[])")
-    if resp.result != "OK":
-        return f"Failed to fetch message: {resp.result}"
-
-    # Find the raw email data (bytearray from aioimaplib)
-    raw_email = None
-    for line in resp.lines:
-        if isinstance(line, (bytes, bytearray)) and len(line) > 100:
-            raw_email = bytes(line)
-            break
-
-    if not raw_email:
-        return "Could not parse message."
 
     msg = emaillib.message_from_bytes(raw_email)
     from_h = _decode_header(msg.get("From", ""))
@@ -418,37 +401,37 @@ async def imap_move(
         return f"Moving to '{destination}' is blocked for safety. Blocked folders: {', '.join(sorted(_BLOCKED_FOLDERS))}"
 
     try:
-        client = _get_client(mailbox)
+        async with _imap_client(mailbox) as client:
+            resp = await client.select(folder)
+            if resp.result != "OK":
+                return f"Cannot open folder '{folder}': {resp.result}"
+
+            if sequence > 0:
+                msg_id = str(sequence)
+            elif subject_match:
+                resp = await client.search(f'SUBJECT "{subject_match}"')
+                if resp.result != "OK":
+                    return f"Search failed: {resp.result}"
+                seqs = _parse_search_ids(resp)
+                if not seqs:
+                    return f"No message matching subject '{subject_match}'."
+                msg_id = seqs[-1]
+            else:
+                return "Provide either sequence number or subject_match."
+
+            # Use atomic MOVE (RFC 6851) — avoids ghost copies from client sync races
+            resp = await client.move(msg_id, destination)
+            if resp.result != "OK":
+                # Fall back to copy+delete if MOVE not supported
+                resp = await client.copy(msg_id, destination)
+                if resp.result != "OK":
+                    return f"Failed to copy to '{destination}': {resp.result}. Does the folder exist?"
+                await client.store(msg_id, "+FLAGS", r"(\Deleted)")
+                await client.expunge()
+
+            return f"Moved message {msg_id} from '{mailbox}:{folder}' to '{destination}'."
     except ValueError as e:
         return str(e)
-
-    resp = await client.select(folder)
-    if resp.result != "OK":
-        return f"Cannot open folder '{folder}': {resp.result}"
-
-    if sequence > 0:
-        msg_id = str(sequence)
-    elif subject_match:
-        resp = await client.search(f'SUBJECT "{subject_match}"')
-        if resp.result != "OK":
-            return f"Search failed: {resp.result}"
-        seqs = _parse_search_ids(resp)
-        if not seqs:
-            return f"No message matching subject '{subject_match}'."
-        msg_id = seqs[-1]
-    else:
-        return "Provide either sequence number or subject_match."
-
-    resp = await client.copy(msg_id, destination)
-    if resp.result != "OK":
-        return f"Failed to copy to '{destination}': {resp.result}. Does the folder exist?"
-
-    resp = await client.store(msg_id, "+FLAGS", r"(\Deleted)")
-    if resp.result != "OK":
-        return f"Copied but failed to mark original as deleted: {resp.result}"
-
-    await client.expunge()
-    return f"Moved message {msg_id} from '{mailbox}:{folder}' to '{destination}'."
 
 
 if __name__ == "__main__":
