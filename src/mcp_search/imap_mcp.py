@@ -74,6 +74,14 @@ def _parse_date(raw: str | None) -> str:
     return parsed.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M")
 
 
+def _quote_folder(folder: str) -> str:
+    """Quote an IMAP folder name if it contains spaces or special characters."""
+    folder = folder.strip().strip('"')
+    if " " in folder or "/" in folder or "&" in folder:
+        return f'"{folder}"'
+    return folder
+
+
 def _is_blocked_folder(folder: str) -> bool:
     normalised = folder.strip().strip('"')
     return normalised.lower() in {f.lower() for f in _BLOCKED_FOLDERS}
@@ -212,7 +220,7 @@ async def imap_search(
     """
     try:
         async with _imap_client(mailbox) as client:
-            resp = await client.select(folder)
+            resp = await client.select(_quote_folder(folder))
             if resp.result != "OK":
                 return f"Cannot open folder '{folder}': {resp.result}"
 
@@ -293,7 +301,7 @@ async def imap_read(
     """
     try:
         async with _imap_client(mailbox) as client:
-            resp = await client.select(folder)
+            resp = await client.select(_quote_folder(folder))
             if resp.result != "OK":
                 return f"Cannot open folder '{folder}': {resp.result}"
 
@@ -402,7 +410,7 @@ async def imap_move(
 
     try:
         async with _imap_client(mailbox) as client:
-            resp = await client.select(folder)
+            resp = await client.select(_quote_folder(folder))
             if resp.result != "OK":
                 return f"Cannot open folder '{folder}': {resp.result}"
 
@@ -420,10 +428,11 @@ async def imap_move(
                 return "Provide either sequence number or subject_match."
 
             # Use atomic MOVE (RFC 6851) — avoids ghost copies from client sync races
-            resp = await client.move(msg_id, destination)
+            quoted_dest = _quote_folder(destination)
+            resp = await client.move(msg_id, quoted_dest)
             if resp.result != "OK":
                 # Fall back to copy+delete if MOVE not supported
-                resp = await client.copy(msg_id, destination)
+                resp = await client.copy(msg_id, quoted_dest)
                 if resp.result != "OK":
                     return f"Failed to copy to '{destination}': {resp.result}. Does the folder exist?"
                 await client.store(msg_id, "+FLAGS", r"(\Deleted)")
