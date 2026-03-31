@@ -84,7 +84,7 @@ def _format_note_list(notes: list[dict]) -> str:
         if n.get("is_todo"):
             todo = "done" if n.get("todo_completed") else "todo"
         rows.append({
-            "id": n["id"][:8],
+            "id": n["id"],
             "title": n.get("title", ""),
             "updated": _format_ts(n.get("updated_time", 0)),
             "todo": todo,
@@ -215,7 +215,7 @@ async def joplin_list_notebooks() -> str:
     def _render(parent_id: str, depth: int = 0):
         for nb in sorted(by_parent.get(parent_id, []), key=lambda x: x.get("title", "")):
             indent = "  " * depth
-            lines.append(f"{indent}- [{nb['id'][:8]}] {nb.get('title', 'Untitled')}")
+            lines.append(f"{indent}- [{nb['id']}] {nb.get('title', 'Untitled')}")
             _render(nb["id"], depth + 1)
 
     _render("")
@@ -229,7 +229,7 @@ async def joplin_list_tags() -> str:
     if not tags:
         return "No tags found."
 
-    rows = [{"id": t["id"][:8], "tag": t.get("title", "")} for t in sorted(tags, key=lambda x: x.get("title", ""))]
+    rows = [{"id": t["id"], "tag": t.get("title", "")} for t in sorted(tags, key=lambda x: x.get("title", ""))]
     return _format_table(rows, ["id", "tag"])
 
 
@@ -269,7 +269,7 @@ async def joplin_create_note(
 
     resp = await _api("POST", "/notes", json=payload)
     n = resp.json()
-    return f"Note created: [{n['id'][:8]}] {n.get('title', title)}"
+    return f"Note created: [{n['id']}] {n.get('title', title)}"
 
 
 @mcp.tool
@@ -308,7 +308,7 @@ async def joplin_update_note(
 
     resp = await _api("PUT", f"/notes/{note_id}", json=payload)
     n = resp.json()
-    return f"Note updated: [{n['id'][:8]}] {n.get('title', '')}"
+    return f"Note updated: [{n['id']}] {n.get('title', '')}"
 
 
 @mcp.tool
@@ -320,7 +320,7 @@ async def joplin_tag_note(tag_id: str, note_id: str) -> str:
         note_id: The note ID to tag
     """
     await _api("POST", f"/tags/{tag_id}/notes", json={"id": note_id})
-    return f"Tag {tag_id[:8]} added to note {note_id[:8]}."
+    return f"Tag {tag_id} added to note {note_id}."
 
 
 @mcp.tool
@@ -332,7 +332,7 @@ async def joplin_untag_note(tag_id: str, note_id: str) -> str:
         note_id: The note ID to untag
     """
     await _api("DELETE", f"/tags/{tag_id}/notes/{note_id}")
-    return f"Tag {tag_id[:8]} removed from note {note_id[:8]}."
+    return f"Tag {tag_id} removed from note {note_id}."
 
 
 if __name__ == "__main__":
