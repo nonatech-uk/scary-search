@@ -335,6 +335,19 @@ async def joplin_untag_note(tag_id: str, note_id: str) -> str:
     return f"Tag {tag_id} removed from note {note_id}."
 
 
+@mcp.tool
+async def joplin_sync() -> str:
+    """Trigger an immediate sync between the Joplin CLI and the Joplin Server.
+
+    Use after creating/updating notes to push changes, or to pull
+    recent changes made in other Joplin clients.
+    """
+    sync_url = _JOPLIN_URL.rsplit(":", 1)[0] + ":41186"
+    client = _client()
+    resp = await client.get(f"{sync_url}/sync", timeout=90.0)
+    return resp.text
+
+
 if __name__ == "__main__":
     from mcp_search.run import serve
     serve(mcp)

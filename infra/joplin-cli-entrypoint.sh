@@ -26,6 +26,25 @@ joplin sync || echo "WARNING: Initial sync failed, will retry in background"
     done
 ) &
 
+echo "Starting sync trigger on port 41186..."
+node -e "
+const http = require('http');
+const { execFile } = require('child_process');
+http.createServer((req, res) => {
+  if (req.url === '/sync') {
+    execFile('joplin', ['sync'], { timeout: 60000 }, (err, stdout, stderr) => {
+      const out = (stdout || '').trim();
+      const msg = err ? 'Sync failed: ' + (stderr || err.message) : 'Sync complete: ' + out;
+      res.writeHead(err ? 500 : 200, { 'Content-Type': 'text/plain' });
+      res.end(msg);
+    });
+  } else {
+    res.writeHead(404);
+    res.end('Not found');
+  }
+}).listen(41186, '0.0.0.0');
+" &
+
 echo "Starting Joplin API server on port 41184..."
 # joplin server start binds to 127.0.0.1, so use socat to expose on 0.0.0.0
 socat TCP-LISTEN:41184,fork,reuseaddr,bind=0.0.0.0 TCP:127.0.0.1:41185 &
