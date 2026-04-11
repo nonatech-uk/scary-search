@@ -1,8 +1,10 @@
 """MCP server for read-only Immich photo library access."""
 
 import base64
+import json
 import os
 
+import anthropic
 import httpx
 from fastmcp import FastMCP
 from fastmcp.server.dependencies import get_context
@@ -10,6 +12,10 @@ from fastmcp.server.lifespan import lifespan
 
 _IMMICH_URL = os.environ.get("IMMICH_URL", "http://immich-server:2283")
 _IMMICH_KEY = os.environ["IMMICH_API_KEY"]
+_MEILI_URL = os.environ.get("MEILISEARCH_URL", "http://meilisearch-docs:7700")
+_MEILI_KEY = os.environ.get("MEILISEARCH_KEY", "")
+_MEILI_INDEX = "immich_photos"
+_ANTHROPIC_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 
 
 @lifespan
@@ -18,8 +24,14 @@ async def immich_lifespan(server):
         headers={"x-api-key": _IMMICH_KEY},
         timeout=30.0,
     )
-    yield {"client": client}
+    meili = httpx.AsyncClient(
+        headers={"Authorization": f"Bearer {_MEILI_KEY}"},
+        timeout=15.0,
+    )
+    claude = anthropic.Anthropic(api_key=_ANTHROPIC_KEY) if _ANTHROPIC_KEY else None
+    yield {"client": client, "meili": meili, "claude": claude}
     await client.aclose()
+    await meili.aclose()
 
 
 mcp = FastMCP("immich", lifespan=immich_lifespan)
@@ -27,6 +39,14 @@ mcp = FastMCP("immich", lifespan=immich_lifespan)
 
 def _client() -> httpx.AsyncClient:
     return get_context().lifespan_context["client"]
+
+
+def _meili() -> httpx.AsyncClient:
+    return get_context().lifespan_context["meili"]
+
+
+def _claude() -> anthropic.Anthropic | None:
+    return get_context().lifespan_context["claude"]
 
 
 def _format_table(rows: list[dict], keys: list[str]) -> str:
@@ -69,41 +89,170 @@ def _format_assets(assets: list[dict], header: str) -> str:
     return header + table + footer
 
 
+def _format_index_hit(hit: dict) -> dict:
+    """Format a Meilisearch immich_photos hit for display."""
+    taken = (hit.get("taken_at") or "")[:19].replace("T", " ")
+    city = hit.get("city") or ""
+    country = hit.get("country") or ""
+    location = ", ".join(filter(None, [city, country])) or "—"
+    people = hit.get("people") or []
+    return {
+        "filename": hit.get("original_filename") or "—",
+        "date": taken,
+        "location": location,
+        "people": ", ".join(people) if people else "—",
+        "scene": hit.get("scene_type") or "—",
+        "id": hit.get("asset_id") or "",
+    }
+
+
+def _format_index_results(hits: list[dict], header: str) -> str:
+    """Format Meilisearch results into a table."""
+    rows = [_format_index_hit(h) for h in hits]
+    table = _format_table(rows, ["filename", "date", "location", "people", "scene"])
+    ids = [r["id"] for r in rows if r["id"]]
+    footer = f"\nAsset IDs: {', '.join(ids)}" if ids else ""
+
+    # Add descriptions for context
+    descs = []
+    for h in hits:
+        desc = h.get("description")
+        if desc:
+            fname = h.get("original_filename") or h.get("asset_id", "")[:8]
+            descs.append(f"  {fname}: {desc}")
+    desc_block = "\n\nDescriptions:\n" + "\n".join(descs) if descs else ""
+
+    return header + table + footer + desc_block
+
+
 @mcp.tool
 async def immich_search(
     query: str,
-    page: int = 1,
-    size: int = 25,
+    limit: int = 25,
 ) -> str:
-    """Search photos using natural language (CLIP embeddings).
+    """Search photos using natural language across Claude Vision descriptions, people, tags, locations, and activities.
 
-    Finds photos matching descriptive queries like "sunset on the beach",
-    "birthday cake", or "cat sleeping on sofa".
+    Finds photos matching queries like "sunset on the beach", "Fran skiing",
+    "receipts from New York", "dog in the garden", or "golden hour mountains".
 
     Args:
         query: Natural language search text
-        page: Page number for pagination (default 1)
-        size: Results per page (default 25, max 100)
+        limit: Max results (default 25, max 100)
     """
-    client = _client()
-    resp = await client.post(
-        f"{_IMMICH_URL}/api/search/smart",
-        json={"query": query, "page": page, "size": min(size, 100)},
+    meili = _meili()
+    resp = await meili.post(
+        f"{_MEILI_URL}/indexes/{_MEILI_INDEX}/search",
+        json={
+            "q": query,
+            "limit": min(limit, 100),
+            "attributesToSearchOn": [
+                "description", "people", "albums", "user_tags",
+                "activities", "visual_tags", "city", "country", "text_content",
+            ],
+        },
     )
-    if resp.status_code == 500:
-        return "Smart search unavailable (Immich machine-learning service may not be running). Use immich_search_metadata instead."
     resp.raise_for_status()
     data = resp.json()
+    hits = data.get("hits", [])
+    total = data.get("estimatedTotalHits", len(hits))
 
-    items = data.get("assets", {}).get("items", [])
-    total = data.get("assets", {}).get("total", 0)
-    count = len(items)
-
-    if not items:
+    if not hits:
         return f"No photos found matching '{query}'."
 
-    header = f"Smart search for '{query}' (page {page}, {count} of {total}):\n\n"
-    return _format_assets(items, header)
+    header = f"Search for '{query}' ({len(hits)} of ~{total} results):\n\n"
+    return _format_index_results(hits, header)
+
+
+@mcp.tool
+async def immich_smart_search(
+    query: str,
+    limit: int = 25,
+) -> str:
+    """Smart photo search — parses complex natural language into structured filters.
+
+    Use for queries that combine people, activities, locations, dates, or counts.
+    Examples: "all of us at dinner", "photos without people", "ski touring in Lyngen",
+    "Fran on the ski slopes", "golden hour in the mountains".
+
+    Falls back to basic search if Claude is unavailable.
+
+    Args:
+        query: Natural language search query
+        limit: Max results (default 25, max 100)
+    """
+    claude = _claude()
+    if not claude:
+        # Fall back to basic search
+        return await immich_search(query=query, limit=limit)
+
+    # Ask Claude to extract structured filters
+    try:
+        response = claude.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=256,
+            messages=[{"role": "user", "content": f"""Convert this photo search query into structured filters. Return ONLY valid JSON, no preamble:
+Query: "{query}"
+Return: {{"people": [], "activities": [], "scene_type": null, "people_count_min": null, "people_count_max": null, "season": null, "mood": null, "city": null, "country": null, "is_video": null, "camera": null, "text_search": "remaining natural language terms"}}
+Only include fields that are clearly implied by the query. Set unused fields to null or empty array."""}],
+        )
+        text = response.content[0].text.strip()
+        if text.startswith("```"):
+            lines = text.split("\n")
+            lines = [l for l in lines if not l.strip().startswith("```")]
+            text = "\n".join(lines)
+        filters = json.loads(text)
+    except Exception:
+        # Fall back to basic search on any parsing failure
+        return await immich_search(query=query, limit=limit)
+
+    # Build Meilisearch filter string
+    filter_parts = []
+    for field in ("people", "activities"):
+        for val in filters.get(field) or []:
+            filter_parts.append(f'{field} = "{val}"')
+    for field in ("scene_type", "season", "mood", "city", "country", "camera"):
+        val = filters.get(field)
+        if val:
+            meili_field = "season_hint" if field == "season" else field
+            filter_parts.append(f'{meili_field} = "{val}"')
+    if filters.get("is_video") is not None:
+        filter_parts.append(f'is_video = {str(filters["is_video"]).lower()}')
+    if filters.get("people_count_min") is not None:
+        filter_parts.append(f'people_count >= {filters["people_count_min"]}')
+    if filters.get("people_count_max") is not None:
+        filter_parts.append(f'people_count <= {filters["people_count_max"]}')
+
+    meili_filter = " AND ".join(filter_parts) if filter_parts else None
+    text_query = filters.get("text_search", query) or ""
+
+    meili = _meili()
+    body: dict = {
+        "q": text_query,
+        "limit": min(limit, 100),
+        "attributesToSearchOn": [
+            "description", "people", "albums", "user_tags",
+            "activities", "visual_tags", "city", "country", "text_content",
+        ],
+    }
+    if meili_filter:
+        body["filter"] = meili_filter
+
+    resp = await meili.post(
+        f"{_MEILI_URL}/indexes/{_MEILI_INDEX}/search",
+        json=body,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    hits = data.get("hits", [])
+    total = data.get("estimatedTotalHits", len(hits))
+
+    if not hits:
+        filter_info = f" (filters: {meili_filter})" if meili_filter else ""
+        return f"No photos found matching '{query}'{filter_info}."
+
+    filter_info = f"\nFilters applied: {meili_filter}" if meili_filter else ""
+    header = f"Smart search for '{query}' ({len(hits)} of ~{total} results):{filter_info}\n\n"
+    return _format_index_results(hits, header)
 
 
 @mcp.tool
